@@ -409,7 +409,10 @@ run_socks() {
 	;;
 	ss|ssr)
 		lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $socks_port -server_host $server_host -server_port $port > $config_file
-		ln_start_bin "$(first_type ${type}-local)" "${type}-local" $log_file -c "$config_file" -b "$bind" -u -v
+		ss_program="$(first_type ${type}local ${type}-local)"
+		[ "$(printf '%s' "$ss_program" | awk -F '/' '{print $NF}')" = "${type}local" ] && \
+			ss_extra_arg="-U" || ss_extra_arg="-u"
+		ln_start_bin "$ss_program" "${type}-local" $log_file -c "$config_file" -v $ss_extra_arg
 	;;
 	esac
 
@@ -488,7 +491,10 @@ run_redir() {
 		;;
 		ss|ssr)
 			lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port > $config_file
-			ln_start_bin "$(first_type ${type}-redir)" "${type}-redir" $log_file -c "$config_file" -U -v
+			ss_program="$(first_type ${type}local ${type}-redir)"
+			[ "$(printf '%s' "$ss_program" | awk -F '/' '{print $NF}')" = "${type}local" ] && \
+				ss_extra_arg="--protocol redir -u" || ss_extra_arg="-U"
+			ln_start_bin "$ss_program" "${type}-redir" $log_file -c "$config_file" -v $ss_extra_arg
 		;;
 		esac
 	;;
@@ -574,14 +580,17 @@ run_redir() {
 			fi
 		;;
 		ss|ssr)
+			ss_program="$(first_type ${type}local ${type}-redir)"
+			[ "$(printf '%s' "$ss_program" | awk -F '/' '{print $NF}')" = "${type}local" ] && \
+				ss_extra_arg="--protocol redir"
 			if [ "$kcptun_use" == "1" ]; then
 				lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port -server_host "127.0.0.1" -server_port $KCPTUN_REDIR_PORT > $config_file
 				[ "$UDP_NODE" == "tcp" ] && echolog "Kcptun不支持UDP转发！"
 			else
 				lua $API_GEN_SS -node $node -local_addr "0.0.0.0" -local_port $local_port > $config_file
-				[ "$UDP_NODE" == "tcp" ] && extra_param="-u"
+				[ "$UDP_NODE" == "tcp" ] && ss_extra_arg="$ss_extra_arg -u"
 			fi
-			ln_start_bin "$(first_type ${type}-redir)" "${type}-redir" $log_file -c "$config_file" -v $extra_param
+			ln_start_bin "$ss_program" "${type}-redir" $log_file -c "$config_file" -v $ss_extra_arg
 		;;
 		esac
 		if [ -n "$_socks_flag" ]; then
@@ -792,6 +801,8 @@ start_dns() {
 	nonuse)
 		echolog "  - 不过滤DNS..."
 		TUN_DNS=""
+		use_chinadns_ng=$(config_t_get global always_use_chinadns_ng 0)
+		[ "$use_chinadns_ng" == "0" ] && return
 	;;
 	dns2socks)
 		local dns2socks_socks_server=$(echo $(config_t_get global socks_server 127.0.0.1:9050) | sed "s/#/:/g")
@@ -935,20 +946,16 @@ add_dnsmasq() {
 		[ -n "$CHINADNS_NG" ] && unset fwd_dns
 		sort -u "${RULES_PATH}/direct_host" | gen_dnsmasq_items "whitelist,whitelist6" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/11-direct_host.conf"
 		echolog "  - [$?]域名白名单(whitelist)：${fwd_dns:-默认}"
-
-		#始终使用远程DNS解析代理（黑名单）列表
-		if [ "${DNS_MODE}" = "fake_ip" ]; then
-			sort -u "${RULES_PATH}/proxy_host" | gen_dnsmasq_fake_items "11.1.1.1" "${TMP_DNSMASQ_PATH}/90-proxy_host.conf"
+		
+		if [ "$(config_t_get global_subscribe subscribe_proxy 0)" = "0" ]; then
+			#如果没有开启通过代理订阅
+			fwd_dns="${LOCAL_DNS}"
+			for item in $(get_enabled_anonymous_secs "@subscribe_list"); do
+				host_from_url "$(config_n_get ${item} url)" | gen_dnsmasq_items "whitelist,whitelist6" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/12-subscribe.conf"
+			done
+			echolog "  - [$?]节点订阅域名(whitelist)：${fwd_dns:-默认}"
 		else
-			fwd_dns="${TUN_DNS}"
-			[ -n "$CHINADNS_NG" ] && fwd_dns="${china_ng_gfw}"
-			[ -n "$CHINADNS_NG" ] && unset fwd_dns
-			sort -u "${RULES_PATH}/proxy_host" | gen_dnsmasq_items "blacklist,blacklist6" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/90-proxy_host.conf"
-			echolog "  - [$?]代理域名表(blacklist)：${fwd_dns:-默认}"
-		fi
-
-		#如果开启了通过代理订阅
-		[ "$(config_t_get global_subscribe subscribe_proxy 0)" = "1" ] && {
+			#如果开启了通过代理订阅
 			fwd_dns="${TUN_DNS}"
 			[ -n "$CHINADNS_NG" ] && fwd_dns="${china_ng_gfw}"
 			for item in $(get_enabled_anonymous_secs "@subscribe_list"); do
@@ -959,7 +966,18 @@ add_dnsmasq() {
 				fi
 			done
 			[ "${DNS_MODE}" != "fake_ip" ] && echolog "  - [$?]节点订阅域名(blacklist)：${fwd_dns:-默认}"
-		}
+		fi
+		
+		#始终使用远程DNS解析代理（黑名单）列表
+		if [ "${DNS_MODE}" = "fake_ip" ]; then
+			sort -u "${RULES_PATH}/proxy_host" | gen_dnsmasq_fake_items "11.1.1.1" "${TMP_DNSMASQ_PATH}/97-proxy_host.conf"
+		else
+			fwd_dns="${TUN_DNS}"
+			[ -n "$CHINADNS_NG" ] && fwd_dns="${china_ng_gfw}"
+			[ -n "$CHINADNS_NG" ] && unset fwd_dns
+			sort -u "${RULES_PATH}/proxy_host" | gen_dnsmasq_items "blacklist,blacklist6" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/97-proxy_host.conf"
+			echolog "  - [$?]代理域名表(blacklist)：${fwd_dns:-默认}"
+		fi
 
 		#分流规则
 		[ "$(config_n_get $TCP_NODE protocol)" = "_shunt" ] && {
@@ -998,7 +1016,7 @@ add_dnsmasq() {
 			[ -n "${chnlist}" ] && {
 				fwd_dns="${LOCAL_DNS}"
 				[ -n "$CHINADNS_NG" ] && unset fwd_dns
-				sort -u "${TMP_PATH}/chnlist" | gen_dnsmasq_items "chnroute,chnroute6" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/12-chinalist_host.conf"
+				sort -u "${TMP_PATH}/chnlist" | gen_dnsmasq_items "chnroute,chnroute6" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/19-chinalist_host.conf"
 				echolog "  - [$?]中国域名表(chnroute)：${fwd_dns:-默认}"
 			}
 		else
@@ -1017,7 +1035,7 @@ add_dnsmasq() {
 		echo "conf-dir=${TMP_DNSMASQ_PATH}" > "/var/dnsmasq.d/dnsmasq-${CONFIG}.conf"
 
 		if [ -z "${CHINADNS_NG}" ] && [ "${IS_DEFAULT_DNS}" = "1" ]; then
-			echolog "  - 不强制设置默认DNS"
+			#echolog "  - 不强制设置默认DNS"
 			return
 		else
 			echo "${DEFAULT_DNS}" > $TMP_PATH/default_DNS
@@ -1096,6 +1114,8 @@ gen_pdnsd_config() {
 				purge_cache = off;
 				proxy_only = on;
 				caching = $_cache;
+				reject = ::/0;
+				reject_policy = negate;
 			}
 		EOF
 		echolog "  | - [$?]上游DNS：${2}:${3}"
